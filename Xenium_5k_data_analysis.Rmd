@@ -1,0 +1,769 @@
+---
+title: "Xenium 5k Data Analysis Journey"
+author: ""
+date: "`r Sys.Date()`"
+output:
+  html_notebook:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+---
+
+> **Note:** 10x Genomics does not provide support for community-developed tools
+> and makes no guarantees regarding their function or performance. Please contact
+> tool developers with any questions.
+
+---
+
+# 1. Install Packages
+
+## 1.a. Install pre-built R packages (recommended for quick setup)
+
+```{r install-prebuilt, eval=FALSE}
+system("wget https://cf.10xgenomics.com/supp/xenium/analysis-workshop/R_library_v4-5.tar.gz")
+system("tar -xzvf ./R_library_v4-5.tar.gz")
+system(paste0("cp -r ./R_library_v4-5/* ", .libPaths()[1]))
+```
+
+## 1.b. Install packages from R repositories (for your own computing system)
+
+This step takes a very long time. Only use if you plan to run these analyses on
+your own system. Always ensure software packages are up-to-date.
+
+```{r install-from-repos, eval=FALSE}
+lib_loc_xenium <- "./xenium_libs"
+dir.create(lib_loc_xenium, showWarnings = FALSE, recursive = TRUE)
+
+system("sudo apt-get install libmagick++-dev")
+install.packages("Seurat")
+install.packages("harmony")
+
+if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+remotes::install_github("prabhakarlab/Banksy")
+remotes::install_github("satijalab/seurat-wrappers")
+remotes::install_github("immunogenomics/presto")  # speeds up DE analysis
+remotes::install_github("bnprks/BPCells/r")
+install.packages("hdf5r")
+install.packages("sf")
+install.packages("arrow")
+```
+
+---
+
+# 2. Xenium Data Visualization and Analysis (Single Sample)
+
+The Seurat team has developed functions to load and analyze one Xenium dataset.
+`LoadXenium` handles all required files automatically.
+
+**Required files (from your Xenium output directory):**
+
+- `cell_feature_matrix/` — cell-level gene expression
+- `cell_boundaries.parquet` — cell segmentation boundaries
+- `cells.parquet` — cell-level metadata
+- `transcripts.parquet` — transcript-level information
+
+## 2.1 Download Xenium Prime Breast Cancer Data
+
+```{r download-single-sample, eval=FALSE}
+system("wget https://cf.10xgenomics.com/supp/xenium/analysis-workshop/one-sample-analysis.tar.gz")
+system("tar -xzvf ./one-sample-analysis.tar.gz")
+```
+
+## 2.2 Load Xenium Data
+
+```{r load-libraries-single}
+library(Seurat)
+library(sf)
+library(ggplot2)
+library(arrow)
+library(hdf5r)
+library(Banksy)
+library(SeuratWrappers)
+```
+
+> **Note on `transcripts.parquet`:** From Xenium Analyzer v3.0+,
+> `transcripts.csv.gz` is no longer provided. Seurat v5.2.0+ can load
+> `transcripts.parquet` directly if the `arrow` package is installed
+> (`install.packages("arrow")`).
+
+**[Optional Tip] Convert `transcripts.parquet` to `transcripts.csv.gz`**
+(only needed if using an older Xenium Analyzer version):
+
+```{r convert-parquet-optional, eval=FALSE}
+library(arrow)
+tx <- read_parquet("./one-sample-analysis/Xenium_Prime_Breast_Cancer_FFPE_outs/transcripts.parquet")
+tx$transcript_id <- as.character(tx$transcript_id)
+tx_gz <- gzfile("./one-sample-analysis/Xenium_Prime_Breast_Cancer_FFPE_outs/transcripts.csv.gz", "w")
+write.csv(tx, row.names = FALSE, col.names = TRUE, quote = FALSE, tx_gz)
+close(tx_gz)
+```
+
+```{r load-xenium}
+# Loading time is ~16 mins for this large dataset
+xenium.obj <- LoadXenium(
+  "./one-sample-analysis/Xenium_Prime_Breast_Cancer_FFPE_outs",
+  fov          = "fov",
+  segmentations = "cell",
+  flip.xy      = TRUE
+)
+
+xenium.obj
+```
+
+```{r inspect-metadata}
+metadata <- xenium.obj@meta.data
+head(metadata, n = 3)
+```
+
+## 2.3 Transcript Plotting Functions
+
+**Total transcripts per cell (spatial):**
+
+```{r plot-total-transcripts, fig.width=10, fig.height=16}
+ImageFeaturePlot(
+  xenium.obj, fov      = "fov",
+  features  = "nCount_Xenium",
+  max.cutoff = "q95"
+) + scale_y_reverse()
+```
+
+**Spatial gene expression — selected genes:**
+
+```{r plot-gene-expression, fig.width=5, fig.height=7}
+ImageFeaturePlot(xenium.obj, features = "ERBB2",
+                 max.cutoff = "q95", cols = c("black", "white")) +
+  scale_y_reverse()
+
+ImageFeaturePlot(xenium.obj, features = "IL7R",
+                 max.cutoff = "q95", cols = c("black", "white")) +
+  scale_y_reverse()
+```
+
+## 2.4 Select Sub-Region of Interest
+
+### 2.4.1 Select Sub-Region by Coordinates
+
+Export coordinates from Xenium Explorer. The CSV will look like:
+
+```
+# Selection name: Selection 1
+# Area (µm^2): 6238188.5
+X,Y
+2082.27,2883.95
+4605.83,2883.95
+4605.83,5355.93
+2082.27,5355.93
+2082.27,2883.95
+```
+
+```{r crop-by-coordinates}
+min_x <- 2082.2669778917857
+min_y <- 2883.948207577963
+max_x <- 4605.827306527083
+max_y <- 5355.927347229994
+
+options(future.globals.maxSize = 1e10)
+crop <- Crop(xenium.obj[["fov"]],
+             x = c(min_x, max_x),
+             y = c(min_y, max_y))
+
+xenium.obj.new <- xenium.obj
+xenium.obj.new[["myarea"]] <- crop
+xenium.obj.new
+```
+
+```{r plot-cropped-region, fig.width=8, fig.height=8}
+ImageFeaturePlot(
+  xenium.obj.new, fov       = "myarea",
+  features  = "nCount_Xenium",
+  cols      = c("black", "white"),
+  max.cutoff = "q95"
+) + scale_y_reverse()
+```
+
+### 2.4.2 Select Sub-Region by Cell IDs
+
+Export a cell stats CSV from Xenium Explorer, then:
+
+```{r select-by-cell-ids}
+select_cells <- read.csv(
+  "./one-sample-analysis/Selection_1_cells_stats.csv",
+  skip = 2, header = TRUE
+)
+head(select_cells, n = 3)
+
+xenium.obj.sub <- subset(xenium.obj, cells = select_cells$Cell.ID)
+xenium.obj.sub
+```
+
+```{r plot-subset, fig.width=8, fig.height=8}
+ImageFeaturePlot(
+  xenium.obj.sub, fov       = "fov",
+  features  = "nCount_Xenium",
+  cols      = c("black", "white"),
+  max.cutoff = "q95"
+) + scale_y_reverse()
+```
+
+## 2.5 Downstream Analysis
+
+### 2.5.1 Quality Control and Preprocessing
+
+```{r qc-histogram}
+hist(xenium.obj$nCount_Xenium, xlim = c(0, 200), breaks = 5000,
+     main = "Transcript counts per cell", xlab = "nCount_Xenium")
+abline(v = 20, col = "red")
+```
+
+```{r qc-filter}
+# Upper limit: 98th percentile; Lower limit: 20 (set from histogram above)
+thres <- quantile(xenium.obj$nCount_Xenium, 0.98)
+xenium.obj <- subset(xenium.obj,
+                     subset = nCount_Xenium >= 20 & nCount_Xenium <= thres)
+```
+
+```{r normalize}
+# Library-size normalization; scale factor = median transcript count
+xenium.obj <- NormalizeData(xenium.obj,
+                            scale.factor = median(xenium.obj$nCount_Xenium))
+```
+
+```{r variable-features}
+# For Xenium Prime (>5k genes): top 2k variable genes
+xenium.obj <- FindVariableFeatures(xenium.obj)
+
+# For Xenium v1 panel (use ALL genes instead):
+# xenium.obj <- FindVariableFeatures(xenium.obj, nfeatures = nrow(xenium.obj))
+```
+
+```{r scale-pca}
+xenium.obj <- ScaleData(xenium.obj)
+xenium.obj <- RunPCA(xenium.obj, verbose = FALSE)
+```
+
+```{r cluster-umap}
+xenium.obj <- FindNeighbors(xenium.obj, dims = 1:30)
+xenium.obj <- FindClusters(xenium.obj, verbose = FALSE)
+xenium.obj <- RunUMAP(xenium.obj, dims = 1:30, verbose = FALSE)
+```
+
+### 2.5.2 UMAP of Clustering Results
+
+```{r umap-plot}
+DimPlot(xenium.obj)
+```
+
+### 2.5.3 Spatial Clustering Plot
+
+```{r spatial-cluster-plot, fig.width=10, fig.height=14}
+ImageDimPlot(xenium.obj) + scale_y_reverse()
+```
+
+### 2.5.4 Export Clustering Results for Xenium Explorer
+
+```{r export-clustering}
+clustering_res <- FetchData(xenium.obj, vars = "seurat_clusters")
+clustering_res$cell_id <- rownames(clustering_res)
+clustering_res <- clustering_res[, c("cell_id", "seurat_clusters")]
+colnames(clustering_res) <- c("cell_id", "group")
+
+head(clustering_res, n = 3)
+
+write.table(clustering_res, "seurat_clustering_results.csv",
+            col.names = TRUE, row.names = FALSE, quote = FALSE, sep = ",")
+```
+
+### 2.5.5 Find Marker Genes per Cluster
+
+```{r find-markers}
+all.markers <- FindAllMarkers(xenium.obj, only.pos = TRUE,
+                              min.pct = 0.05, logfc.threshold = 1)
+head(all.markers)
+
+write.table(all.markers, "marker_genes_in_seurat_clusters.csv",
+            col.names = TRUE, row.names = FALSE, quote = FALSE, sep = ",")
+```
+
+### 2.5.6 Cell Annotation Based on Marker Genes
+
+Suggested workflow:
+
+1. Get marker genes per cluster from `marker_genes_in_seurat_clusters.csv`
+2. Use a tool like **[Enrichr](https://maayanlab.cloud/Enrichr/)** to find
+   associated cell types
+3. Cross-reference spatial location in Xenium Explorer (with H&E if available)
+
+**Example — verify macrophage marker C1QC in cluster 6:**
+
+```{r vln-macrophage, fig.width=12, fig.height=8}
+VlnPlot(xenium.obj, features = "C1QC", layer = "data", pt.size = 0)
+```
+
+---
+
+# 3. Multi-Sample Integration (Seurat Sketch + Harmony)
+
+Two Xenium Prime datasets are integrated here:
+
+- **Human breast cancer** Xenium Prime
+- **Human cervical cancer** Xenium Prime
+
+For large datasets (>1.5M cells combined), we use **Seurat sketch** to
+subsample cells while preserving rare populations, and **Harmony** for batch
+correction.
+
+Only `cell_feature_matrix.h5` is required per sample.
+
+## 3.1 Load Libraries
+
+```{r load-libraries-multi}
+library(Seurat)
+library(ggplot2)
+library(BPCells)
+library(SeuratWrappers)
+options(future.globals.maxSize = 1e10)
+```
+
+## 3.2 Download Data
+
+```{r download-multi-sample, eval=FALSE}
+system("wget https://cf.10xgenomics.com/supp/xenium/analysis-workshop/multi-sample-analysis.tar.gz")
+system("tar -xzvf ./multi-sample-analysis.tar.gz")
+```
+
+## 3.3 Create On-Disk Matrix Representations
+
+```{r create-ondisk-breast}
+xenium.breast <- open_matrix_10x_hdf5(
+  path         = "./multi-sample-analysis/human_breast_xenium/cell_feature_matrix.h5",
+  feature_type = "Gene Expression"
+)
+write_matrix_dir(mat = xenium.breast, dir = "./xenium_breast_matrix", overwrite = TRUE)
+```
+
+```{r create-ondisk-cervical}
+xenium.cervical <- open_matrix_10x_hdf5(
+  path         = "./multi-sample-analysis/human_cervical_xenium/cell_feature_matrix.h5",
+  feature_type = "Gene Expression"
+)
+write_matrix_dir(mat = xenium.cervical, dir = "./xenium_cervical_matrix", overwrite = TRUE)
+```
+
+```{r load-ondisk-and-rename}
+# Load on-disk matrices
+xenium.breast.count   <- open_matrix_dir(dir = "./xenium_breast_matrix")
+xenium.cervical.count <- open_matrix_dir(dir = "./xenium_cervical_matrix")
+
+# Make cell IDs unique across samples
+colnames(xenium.breast.count)   <- paste(colnames(xenium.breast.count),   "breast",   sep = "_")
+colnames(xenium.cervical.count) <- paste(colnames(xenium.cervical.count), "cervical", sep = "_")
+```
+
+```{r convert-ensembl-breast}
+# Convert Ensembl IDs to gene names (breast)
+features <- read.table(
+  "./multi-sample-analysis/human_breast_xenium/features.tsv.gz",
+  sep = "\t", header = FALSE
+)
+features <- features[features$V3 == "Gene Expression", ]
+features <- features[match(rownames(xenium.breast.count), features$V1), ]
+rownames(xenium.breast.count) <- features$V2
+```
+
+```{r convert-ensembl-cervical}
+# Convert Ensembl IDs to gene names (cervical)
+features <- read.table(
+  "./multi-sample-analysis/human_cervical_xenium/features.tsv.gz",
+  sep = "\t", header = FALSE
+)
+features <- features[features$V3 == "Gene Expression", ]
+features <- features[match(rownames(xenium.cervical.count), features$V1), ]
+rownames(xenium.cervical.count) <- features$V2
+```
+
+**[Tip] Working with multiple tissues from one Xenium slide (e.g., TMA)?**
+
+Use Section 2.4.2 to get cell IDs per tissue region, then subset the matrix:
+
+```{r tma-subset-tip, eval=FALSE}
+gene_exp_data <- Read10X_h5("./multi-sample-analysis/human_breast_xenium/cell_feature_matrix.h5")
+gene_exp_data <- gene_exp_data$`Gene Expression`
+
+tissue1_cells <- read.csv("./multi-sample-analysis/Tissue_1_cells_stats.csv",
+                          skip = 2, header = TRUE)
+
+gene_exp_data_tissue1 <- gene_exp_data[, tissue1_cells$Cell.ID]
+write_matrix_dir(mat = gene_exp_data_tissue1, dir = "./tissue1_matrix", overwrite = TRUE)
+
+tissue1.mat <- open_matrix_dir(dir = "./tissue1_matrix")
+colnames(tissue1.mat) <- paste(colnames(tissue1.mat), "tissue1", sep = "_")
+# Repeat for tissues 2, 3, etc., then proceed to Section 3.4
+```
+
+## 3.4 Create Merged Seurat Object
+
+```{r create-seurat-merged}
+countlist <- list(xenium.breast.count, xenium.cervical.count)
+names(countlist) <- c("breast", "cervical")
+
+merge.obj <- CreateSeuratObject(countlist)
+
+# Tag each cell with its sample origin
+samples <- sapply(strsplit(colnames(merge.obj), "_"), function(x) x[2])
+merge.obj$samples <- samples
+```
+
+## 3.5 QC and Sketch Subsampling
+
+```{r qc-multi-histogram}
+hist(merge.obj$nCount_RNA, xlim = c(0, 200), breaks = 5000,
+     main = "Transcript counts per cell", xlab = "nCount_RNA")
+abline(v = 20, col = "red")
+```
+
+```{r qc-multi-filter}
+thres <- quantile(merge.obj$nCount_RNA, 0.98)
+merge.obj <- subset(merge.obj,
+                    subset = nCount_RNA >= 20 & nCount_RNA <= thres)
+```
+
+```{r normalize-multi}
+merge.obj <- NormalizeData(merge.obj,
+                           scale.factor = median(merge.obj$nCount_RNA))
+```
+
+```{r variable-features-multi}
+# For Xenium Prime (>5k genes):
+merge.obj <- FindVariableFeatures(merge.obj, verbose = FALSE)
+
+# For Xenium v1 panel (use ALL genes):
+# merge.obj <- FindVariableFeatures(merge.obj, nfeatures = nrow(merge.obj))
+```
+
+```{r sketch-subsample}
+# 25k cells sampled per dataset (50k total in memory)
+# Adjust ncells based on your dataset sizes
+# e.g., ncells = c(25000, 35000) for unequal sampling
+merge.obj <- SketchData(
+  merge.obj,
+  ncells         = 25000,
+  method         = "LeverageScore",
+  sketched.assay = "sketch",
+  features       = VariableFeatures(merge.obj)
+)
+
+merge.obj
+```
+
+## 3.6 Conventional Processing on Sketch (50k cells)
+
+```{r process-sketch}
+DefaultAssay(merge.obj) <- "sketch"
+merge.obj <- FindVariableFeatures(merge.obj, verbose = FALSE)
+merge.obj <- ScaleData(merge.obj, verbose = FALSE)
+merge.obj <- RunPCA(merge.obj, verbose = FALSE)
+```
+
+## 3.7 Batch Correction with Harmony
+
+**First, check for batch effects without correction:**
+
+```{r umap-no-correction}
+merge.obj <- RunUMAP(merge.obj, dims = 1:30, return.model = TRUE, verbose = FALSE)
+DimPlot(merge.obj, group.by = "samples")
+```
+
+**Apply Harmony batch correction:**
+
+```{r harmony-integration}
+merge.obj <- IntegrateLayers(
+  merge.obj,
+  method        = HarmonyIntegration,
+  orig          = "pca",
+  new.reduction = "harmony",
+  dims          = 1:30
+)
+```
+
+```{r umap-harmony}
+merge.obj <- RunUMAP(merge.obj, reduction = "harmony", dims = 1:30,
+                     return.model = TRUE, verbose = FALSE)
+```
+
+```{r cluster-harmony}
+merge.obj <- FindNeighbors(merge.obj, reduction = "harmony", dims = 1:30)
+merge.obj <- FindClusters(merge.obj, resolution = 1, verbose = FALSE)
+```
+
+```{r plot-harmony-umap}
+DimPlot(merge.obj, group.by = "samples")
+DimPlot(merge.obj)
+```
+
+## 3.8 Project Results from 50k Sketch to All Cells
+
+```{r project-integration}
+merge.obj <- ProjectIntegration(
+  object         = merge.obj,
+  sketched.assay = "sketch",
+  assay          = "RNA",
+  reduction      = "harmony"
+)
+```
+
+```{r project-data}
+merge.obj <- ProjectData(
+  object             = merge.obj,
+  assay              = "RNA",
+  full.reduction     = "harmony.full",
+  sketched.assay     = "sketch",
+  sketched.reduction = "harmony.full",
+  umap.model         = "umap",
+  dims               = 1:30,
+  refdata            = list(cluster_full = "seurat_clusters")
+)
+```
+
+```{r plot-full-umap}
+DimPlot(merge.obj, reduction = "full.umap", group.by = "cluster_full", label = TRUE)
+DimPlot(merge.obj, reduction = "full.umap", group.by = "samples")
+```
+
+## 3.9 Export Clustering Results for Xenium Explorer
+
+```{r export-multi-clustering}
+clusters_all <- FetchData(merge.obj, vars = c("samples", "cluster_full"),
+                          layer = "counts")
+clusters_all$cell_id <- rownames(clusters_all)
+
+# Breast cancer clustering
+clusters_all_breast <- clusters_all[
+  clusters_all$samples == "breast", c("cell_id", "cluster_full")
+]
+colnames(clusters_all_breast) <- c("cell_id", "group")
+write.table(clusters_all_breast, "integrated_clusters_for_breast.csv",
+            sep = ",", col.names = TRUE, row.names = FALSE, quote = FALSE)
+
+# Cervical cancer clustering
+clusters_all_cervical <- clusters_all[
+  clusters_all$samples == "cervical", c("cell_id", "cluster_full")
+]
+colnames(clusters_all_cervical) <- c("cell_id", "group")
+write.table(clusters_all_cervical, "integrated_clusters_for_cervical.csv",
+            sep = ",", col.names = TRUE, row.names = FALSE, quote = FALSE)
+```
+
+## 3.10 Find Cluster Marker Genes
+
+```{r find-markers-multi}
+DefaultAssay(merge.obj) <- "sketch"
+merge.obj[["sketch"]] <- JoinLayers(merge.obj[["sketch"]])
+
+all.markers <- FindAllMarkers(merge.obj, only.pos = TRUE)
+
+write.table(all.markers, "markers_for_all_clusters_in_sketch.csv",
+            sep = ",", col.names = TRUE, row.names = FALSE, quote = FALSE)
+```
+
+**Example: Visualize macrophage marker C1QC across clusters (cluster 6 = macrophage):**
+
+```{r vln-macrophage-multi, fig.width=12, fig.height=8}
+VlnPlot(merge.obj, assay = "RNA", features = "C1QC",
+        layer = "data", pt.size = 0, group.by = "cluster_full")
+```
+
+**[Tip] Save and reload the integrated Seurat object:**
+
+```{r save-load-seurat, eval=FALSE}
+# Save — keep this .rds file together with xenium_breast_matrix/ and xenium_cervical_matrix/
+saveRDS(merge.obj, "Xenium_integrated_Seurat.rds")
+
+# Reload (on-disk folders must be present)
+merge.obj <- readRDS("./Xenium_integrated_Seurat.rds")
+```
+
+## 3.11 Subset and Analyze Macrophages
+
+```{r subset-macrophages}
+macrophage_cells <- names(merge.obj$cluster_full[merge.obj$cluster_full == 6])
+macro.obj <- subset(merge.obj, cells = macrophage_cells)
+macro.obj
+```
+
+```{r process-macrophages}
+DefaultAssay(macro.obj) <- "RNA"
+
+# For Xenium Prime (>5k genes):
+macro.obj <- FindVariableFeatures(macro.obj, verbose = FALSE)
+# For Xenium v1 panel: macro.obj <- FindVariableFeatures(macro.obj, nfeatures = nrow(macro.obj))
+
+macro.obj <- ScaleData(macro.obj, verbose = FALSE)
+macro.obj <- RunPCA(macro.obj, verbose = FALSE)
+```
+
+```{r harmony-macrophages}
+macro.obj <- IntegrateLayers(
+  macro.obj,
+  method        = HarmonyIntegration,
+  orig          = "pca",
+  new.reduction = "harmony.full",
+  dims          = 1:30
+)
+```
+
+```{r umap-macrophages, fig.width=7, fig.height=7}
+macro.obj <- RunUMAP(macro.obj, reduction = "harmony.full", dims = 1:30,
+                     reduction.name = "umap.full",
+                     reduction.key  = "UMAP_full_", verbose = FALSE)
+
+DimPlot(macro.obj, reduction = "umap.full", group.by = "samples")
+```
+
+**Differential gene expression: breast vs. cervical macrophages:**
+
+> ⚠️ **Statistical note:** p-values below should be interpreted with caution —
+> each cell is treated as an independent replicate. For robust DEG analysis,
+> use biological replicates (≥3 per condition) with a pseudo-bulk approach.
+> See: [Seurat pseudo-bulk DE tutorial](https://satijalab.org/seurat/articles/de_vignette).
+
+```{r deg-macrophages}
+Idents(macro.obj) <- "samples"
+macro.obj[["RNA"]] <- JoinLayers(macro.obj[["RNA"]])
+
+macr.marker <- FindMarkers(macro.obj, ident.1 = "breast", ident.2 = "cervical")
+
+macr.marker$gene <- rownames(macr.marker)
+write.table(macr.marker, "macrophage_DGE.csv",
+            sep = ",", col.names = TRUE, row.names = FALSE, quote = FALSE)
+
+head(macr.marker)
+```
+
+```{r plot-ctsl-feature, fig.width=8, fig.height=8}
+FeaturePlot(macro.obj, features = "CTSL", reduction = "umap.full")
+```
+
+```{r plot-ctsl-violin, fig.width=8, fig.height=8}
+VlnPlot(macro.obj, "CTSL", group.by = "samples")
+```
+
+Higher CTSL expression in macrophages is associated with tumor progression and
+poor prognosis (Zhang et al., 2024; Alderton, 2010; Xiao et al., 2024). The
+analysis shows elevated CTSL in breast cancer macrophages vs. cervical cancer,
+suggesting a more pro-tumor macrophage role in breast cancer.
+
+---
+
+# 4. Spatially-Informed Clustering with Banksy
+
+Standard clustering uses only each cell's gene expression. **Banksy** also
+incorporates mean expression and expression gradients from neighboring cells,
+improving cell-type resolution in spatial data.
+
+Banksy was ranked among the top-performing spatial clustering tools with
+strong scalability (Hu et al., 2024; Singhal et al., 2024).
+
+**Required files (same as Section 2):**
+
+- `cell_feature_matrix/`
+- `cell_boundaries.parquet`
+- `cells.parquet`
+- `transcripts.parquet`
+
+## 4.1 Data Download and Preprocessing
+
+```{r banksy-setup}
+system("sudo apt-get install libmagick++-dev")
+
+library(Seurat)
+library(sf)
+library(ggplot2)
+library(Banksy)
+library(SeuratWrappers)
+```
+
+```{r download-banksy-data, eval=FALSE}
+system("wget https://cf.10xgenomics.com/supp/xenium/analysis-workshop/one-sample-analysis.tar.gz")
+system("tar -xzvf ./one-sample-analysis.tar.gz")
+```
+
+```{r load-xenium-banksy}
+xenium.obj <- LoadXenium(
+  "./one-sample-analysis/Xenium_Prime_Breast_Cancer_FFPE_outs",
+  fov           = "fov",
+  segmentations = "cell",
+  flip.xy       = TRUE
+)
+```
+
+```{r qc-banksy}
+hist(xenium.obj$nCount_Xenium, xlim = c(0, 200), breaks = 5000,
+     main = "Transcript counts per cell", xlab = "nCount_Xenium")
+abline(v = 20, col = "red")
+
+thres <- quantile(xenium.obj$nCount_Xenium, 0.98)
+xenium.obj <- subset(xenium.obj,
+                     subset = nCount_Xenium >= 20 & nCount_Xenium <= thres)
+```
+
+```{r preprocess-banksy}
+xenium.obj <- NormalizeData(xenium.obj,
+                            scale.factor = median(xenium.obj$nCount_Xenium))
+
+# For Xenium Prime (>5k genes):
+xenium.obj <- FindVariableFeatures(xenium.obj)
+# For Xenium v1: xenium.obj <- FindVariableFeatures(xenium.obj, nfeatures = nrow(xenium.obj))
+
+xenium.obj <- ScaleData(xenium.obj)
+```
+
+## 4.2 Run Banksy
+
+- **`lambda = 0.2`** — recommended for cell typing (controls neighborhood weight;
+  `lambda = 0` uses only each cell's own expression)
+- **`k_geom = 15`** — number of neighboring cells to define the neighborhood
+
+```{r run-banksy}
+# ~11 mins for a 490k-cell Xenium Prime dataset
+xenium.obj <- RunBanksy(
+  xenium.obj,
+  lambda   = 0.2,
+  k_geom   = 15,
+  assay    = "Xenium",
+  slot     = "data",
+  features = "variable",
+  verbose  = FALSE
+)
+```
+
+```{r banksy-pca-cluster-umap}
+xenium.obj <- RunPCA(xenium.obj, assay = "BANKSY",
+                     features = rownames(xenium.obj), npcs = 30)
+
+xenium.obj <- FindNeighbors(xenium.obj, dims = 1:30)
+xenium.obj <- FindClusters(xenium.obj, resolution = 0.5)
+xenium.obj <- RunUMAP(xenium.obj, dims = 1:30, verbose = FALSE)
+
+DimPlot(xenium.obj)
+```
+
+## 4.3 Export Banksy Clustering Results for Xenium Explorer
+
+```{r export-banksy}
+clustering_res <- FetchData(xenium.obj, vars = "seurat_clusters")
+clustering_res$cell_id <- rownames(clustering_res)
+clustering_res <- clustering_res[, c("cell_id", "seurat_clusters")]
+colnames(clustering_res) <- c("cell_id", "group")
+
+head(clustering_res, n = 3)
+
+write.table(clustering_res, "banksy_clustering_results.csv",
+            col.names = TRUE, row.names = FALSE, quote = FALSE, sep = ",")
+```
+
+---
+
+*End of Xenium 5k Data Analysis Notebook*
